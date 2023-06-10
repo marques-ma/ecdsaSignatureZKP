@@ -10,10 +10,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"math/big"
-
-	"crypto/x509"
-	"encoding/pem"
-	"os"
 )
 
 type proof struct {
@@ -204,7 +200,7 @@ func GenerateZKP(privateKey *ecdsa.PrivateKey, signature, message []byte, compre
 
 	// Compute s' = k'^{-1}(m + signature.S * r')
 	// k'^{-1}
-	invK = new(big.Int).ModInverse(kPrime, curve.Params().N)
+	invK := new(big.Int).ModInverse(kPrime, curve.Params().N)
 	s := new(big.Int).Mul(asn1Sig.S, RPrimeX)
 	s.Add(s, m)
 	s.Mul(s, invK)
