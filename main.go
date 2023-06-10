@@ -17,20 +17,26 @@ import (
 )
 
 type proof struct {
-	QaPrime  *ecdsa.PublicKey	`json:"QaPrime"`
-	RPrimeX  *big.Int			`json:"RPrimeX"`
-	sPrime   *big.Int			`json:"sPrime"`
+	QaPrime  	*ecdsa.PublicKey	`json:"QaPrime"`
+	OriginalRy  *big.Int			`json:"OriginalRy, omitempty"`
+	Proof		*ecdsaSignature		`json:"Proof"`
 }
 
 type ecdsaSignature struct {
 	R, S *big.Int
 }
 
-var curve = elliptic.P256()
+type ecdsaPoint struct {
+	X, Y *big.Int
+}
+
+var (
+	curve = elliptic.P256()
+	tokenPayload = "tokenpayload"
+)
+
 
 func main() {
-
-	tokenPayload := "tokenpayload"
 
 	// Generate ECDSA key pair
 	privateKey, err := ecdsa.GenerateKey(curve, rand.Reader)
@@ -39,20 +45,22 @@ func main() {
 		return
 	}
 
-	// // Sign the token payload
-	// hash := sha256.Sum256([]byte(tokenPayload))
-	// r, s, err := ecdsa.Sign(rand.Reader, privateKey, hash[:])
-	// if err != nil {
-	// 	fmt.Printf("Error signing token payload: %s\n", err)
-	// 	return
-	// }
-
-	fmt.Printf("Generate ECDSA signature:\n")
-	r, s, err := ecdsaSign(privateKey, []byte(tokenPayload))
+	// Sign the token payload with standard ECDSA scheme (not-compressed R)
+	hash := Hash(tokenPayload)
+	r, s, err := ecdsa.Sign(rand.Reader, privateKey, hash.Bytes())
 	if err != nil {
 		fmt.Printf("Error signing token payload: %s\n", err)
 		return
 	}
+
+	// // // ECDSA signature with compressed R point
+	// fmt.Printf("Generate ECDSA signature:\n")
+	// r, s, err := ecdsaSign(privateKey, []byte(tokenPayload))
+	// if err != nil {
+	// 	fmt.Printf("Error signing token payload: %s\n", err)
+	// 	return
+	// }
+	
 	fmt.Printf("-------------------\n\n")
 
 	// Encode the ECDSA signature
@@ -64,7 +72,7 @@ func main() {
 
 	// Generate zero-knowledge proof
 	fmt.Printf("Generate ZKP of ECDSA signature:\n")
-	zkProof, err := GenerateZKP(privateKey, signatureBytes, []byte(tokenPayload))
+	zkProof, err := GenerateZKP(privateKey, signatureBytes, []byte(tokenPayload), false)
 	if err != nil {
 		fmt.Printf("Error generating zero-knowledge proof: %s\n", err)
 		return
@@ -74,7 +82,7 @@ func main() {
 	// Verify zero-knowledge proof
 	fmt.Printf("Verify ZKP of ECDSA signature:\n")
 	publicKey := privateKey.Public()
-	if !VerifyZKP(zkProof, r.Bytes(), publicKey.(*ecdsa.PublicKey), []byte(tokenPayload)) {
+	if !VerifyZKP(zkProof, r.Bytes(), publicKey.(*ecdsa.PublicKey), []byte(tokenPayload), false) {
 		fmt.Printf("ZKP not valid!!\n")
 		return
 	}
@@ -94,12 +102,8 @@ func main() {
 	fmt.Printf("-------------------\n\n")
 }
 
-func GenerateZKP(privateKey *ecdsa.PrivateKey, signature, message []byte) (zkProof *proof, err error) {
+func GenerateZKP(privateKey *ecdsa.PrivateKey, signature, message []byte, compressed bool) (zkProof *proof, err error) {
 
-	// test values
-	// var testR big.Int
-
-	zkProof = &proof{}
 	// 1 - to Calculate Qa' = signature.s * R is
 	// 
 	// Necessary to retrieve y-coord from compact R point:
@@ -111,22 +115,45 @@ func GenerateZKP(privateKey *ecdsa.PrivateKey, signature, message []byte) (zkPro
 		return nil, fmt.Errorf("error parsing ASN.1 signature: %s", err)
 	}
 
-	// 1.2 - Recover the y-coordinate from the signature.r (x-coordinate)
-	coordX, coordY, err := uncompressPoint(curve, asn1Sig.R.Bytes())
-	if err != nil {
-		return nil, fmt.Errorf("error recovering y-coordinate from R: %s", err)
-	}
+	// 2 - Compute h' = HASH(Qa' || m) or HASH(m) (?)
+	m := Hash(string(message))
 
-	// 1.3 - Create a valid point on the curve
-	RPoint := &ecdsa.PublicKey{
-		Curve: curve,
-		X:     coordX,
-		Y:     coordY,
-	}
+	var RPoint *ecdsaPoint
+	if compressed == true {
+		// 1.2 - Recover the y-coordinate from the signature.r (x-coordinate)
+		coordX, coordY, err := uncompressPoint(curve, asn1Sig.R.Bytes())
+		if err != nil {
+			return nil, fmt.Errorf("error recovering y-coordinate from R: %s", err)
+		}
+	
+		// 1.3 - Create a valid point on the curve
+		RPoint = &ecdsaPoint{
+			X:     coordX,
+			Y:     coordY,
+		}
+	} else {
+		// 1.2 - Recover the 2 y-coordinates from the signature.r (x-coordinate)
+		y1, y2, err := getYCoordinates(asn1Sig.R)
+		if err != nil {
+			return nil, fmt.Errorf("error recovering y-coordinate from R: %s", err)
+		}
 
-	// Verify if RPoint is on curve
-	if !curve.IsOnCurve(RPoint.X, RPoint.Y) {
-		return nil, fmt.Errorf("Point is not on Curve!!\n")
+		// perform the validation of y coordinates through checking Qa' = (m * G) + (r * Qa)
+		correctY := checkYCoordinates(y1, y2, asn1Sig.R, asn1Sig.S, m, privateKey.Public().(*ecdsa.PublicKey))
+		if correctY == nil {
+			return nil, fmt.Errorf("No valid y-coordinate values recovered: %s", err)
+		}
+		// Verify if point is on curve
+		if !curve.IsOnCurve(asn1Sig.R, correctY) {
+			return nil, fmt.Errorf("Point is not on Curve!!\n")
+		}
+		fmt.Println("VALID COORDINATE FOUND!")
+
+		// 1.3 - Create a valid point on the curve
+		RPoint = &ecdsaPoint{
+			X:     asn1Sig.R,
+			Y:     correctY,
+		}	
 	}
 
 	// Using R point, 
@@ -134,9 +161,6 @@ func GenerateZKP(privateKey *ecdsa.PrivateKey, signature, message []byte) (zkPro
 	// Here, R act as Generator
 	QaPrimeX, QaPrimeY := curve.ScalarMult(RPoint.X, RPoint.Y, asn1Sig.S.Bytes())
 	
-	// 2 - Compute h' = HASH(Qa' || m) or HASH(m) (?)
-	m := Hash(string(message))
-
 	// 3 Generate new nonce k'
 	kPrime, err := rand.Int(rand.Reader, curve.Params().N)
 	if err != nil {
@@ -153,28 +177,28 @@ func GenerateZKP(privateKey *ecdsa.PrivateKey, signature, message []byte) (zkPro
 	}
 
 	/////// TEST
-		// (R' * m') / k' = m' * R
+		// // (R' * m') / k' = m' * R
 
-		// (R' * m')
-		NewX, NewY := curve.ScalarMult(RPrimeX, RPrimeY, m.Bytes())
-		// fmt.Println("R * message: ", NewX, NewY)
+		// // (R' * m')
+		// NewX, NewY := curve.ScalarMult(RPrimeX, RPrimeY, m.Bytes())
+		// // fmt.Println("R * message: ", NewX, NewY)
 
-		// k'^-1
-		invK := new(big.Int).ModInverse(kPrime, curve.Params().N)
+		// // k'^-1
+		// invK := new(big.Int).ModInverse(kPrime, curve.Params().N)
 
-		// (R' * m') / k'
-		LeftX, LeftY := curve.ScalarMult(NewX, NewY, invK.Bytes())
+		// // (R' * m') / k'
+		// LeftX, LeftY := curve.ScalarMult(NewX, NewY, invK.Bytes())
 
-		// m' * R
-		rightX, rightY := curve.ScalarMult(RPoint.X, RPoint.Y, m.Bytes())
+		// // m' * R
+		// rightX, rightY := curve.ScalarMult(RPoint.X, RPoint.Y, m.Bytes())
 
-		// Check if left == right
-		fmt.Println(`GenerateZKP Validation performs: (R' * m') / k' = m' * R`)
-		if (LeftX.Cmp(rightX) == 0) && (LeftY.Cmp(rightY) == 0) {
-			fmt.Println(`Validation successfull!`)
-		} else {
-			fmt.Println(`Validation Failed!`)
-		}
+		// // Check if left == right
+		// fmt.Println(`GenerateZKP Validation performs: (R' * m') / k' = m' * R`)
+		// if (LeftX.Cmp(rightX) == 0) && (LeftY.Cmp(rightY) == 0) {
+		// 	fmt.Println(`Validation successfull!`)
+		// } else {
+		// 	fmt.Println(`Validation Failed!`)
+		// }
 
 	////////
 
@@ -193,37 +217,38 @@ func GenerateZKP(privateKey *ecdsa.PrivateKey, signature, message []byte) (zkPro
 			X:     QaPrimeX,
 			Y:     QaPrimeY,
 		},
-		RPrimeX: new(big.Int).SetBytes(compressedRPrime),
-		sPrime:  s,
+		OriginalRy: RPoint.Y,
+		Proof: &ecdsaSignature{
+			R:	new(big.Int).SetBytes(compressedRPrime),
+			S:	s,
+		},
 	}
-
-	// Feito isso, gera e retorna o resultado, que é: Qa', (R', s')
-	// Imagino que deva descartar o RPrimeY, como feito por padrao na assinatura ECDSA
-	// Outra possibilidade é retornar o RPrime comprimido.
 	return zkProof, nil
 }
 
-func VerifyZKP(zkProof *proof, originalRxCoordinate []byte, publicKey *ecdsa.PublicKey, message []byte) bool {
+func VerifyZKP(zkProof *proof, originalRxCoordinate []byte, publicKey *ecdsa.PublicKey, message []byte, compressed bool) bool {
 	
-	// // 1 - Extract r and s from the ECDSA signature
-	// asn1Sig := new(ecdsaSignature)
-	// _, err := asn1.Unmarshal(signature, asn1Sig)
-	// if err != nil {
-	// 	return false
-	// }
+	var RPoint *ecdsaPoint
+	if compressed == true {
+		// 1.2 - Recover the y-coordinate from the signature.r (x-coordinate)
+		coordX, coordY, err := uncompressPoint(curve, originalRxCoordinate)
+		if err != nil {
+			fmt.Errorf("error recovering y-coordinate from R: %s\n", err)
+			return false
+		}
 
-	// 1.2 - Recover the y-coordinate from the signature.r (x-coordinate)
-	coordX, coordY, err := uncompressPoint(curve, originalRxCoordinate)
-	if err != nil {
-		fmt.Errorf("error recovering y-coordinate from R: %s", err)
-		return false
-	}
+		// 1.3 - Create a valid point on the curve
+		RPoint = &ecdsaPoint{
+			X:     coordX,
+			Y:     coordY,
+		}
 
-	// 1.3 - Create a valid point on the curve
-	RPoint := &ecdsa.PublicKey{
-		Curve: curve,
-		X:     coordX,
-		Y:     coordY,
+	} else {
+		// 1.2 - Recover the y-coordinate zkProof.OriginalRy and build RPoint
+		RPoint = &ecdsaPoint{
+			X:     new(big.Int).SetBytes(originalRxCoordinate),
+			Y:     zkProof.OriginalRy,
+		}
 	}
 
 	// Verify if RPoint is on curve
@@ -270,9 +295,10 @@ func VerifyZKP(zkProof *proof, originalRxCoordinate []byte, publicKey *ecdsa.Pub
 
 	// 1 - s' * R' 
 	// Uncompress RPrime
-	uncX, uncY, err := uncompressPoint(curve, zkProof.RPrimeX.Bytes())
+	uncX, uncY, err := uncompressPoint(curve, zkProof.Proof.R.Bytes())
 	if err != nil {
-		fmt.Println("Error:", err)
+		fmt.Errorf("Error decompressing RPrime point: %s\n", err)
+		return false
 	}
 
 	// 1.1 -  Verify if uncompressed RPrime is on curve
@@ -282,7 +308,7 @@ func VerifyZKP(zkProof *proof, originalRxCoordinate []byte, publicKey *ecdsa.Pub
 	}
 
 	// 1.2 - Compute s' * R' 
-	leftSideX, leftSideY := curve.ScalarMult(uncX, uncY, zkProof.sPrime.Bytes())
+	leftSideX, leftSideY := curve.ScalarMult(uncX, uncY, zkProof.Proof.S.Bytes())
 	
 	// 2 - (m * R)
 	// PS: HERE WE ARE CONSIDERING THAT WE ARE USING CUSTOM ECDSA SIGNATURE, WHERE R IS A COMPRESSED POINT. 
@@ -299,7 +325,7 @@ func VerifyZKP(zkProof *proof, originalRxCoordinate []byte, publicKey *ecdsa.Pub
 	fmt.Printf("\n")
 	fmt.Println(`TEST 2: s' * R' = (m * R) + (r' * Qa'): `)
 	if (leftSideX.Cmp(lastX) != 0) || (leftSideY.Cmp(lastY) != 0) {
-		fmt.Println("TEST 2 FAILED!!!!!")
+		fmt.Errorf("TEST 2 FAILED!!!!!\n")
 		return false
 	}
 	fmt.Println("TEST 2 Successful!!!!!")
@@ -312,28 +338,12 @@ func ecdsaSign(privateKey *ecdsa.PrivateKey, message []byte) (r, s *big.Int, err
 	// Step 1: Generate a random nonce (k)
 	k, err := rand.Int(rand.Reader, curve.Params().N)
 	if err != nil {
-		fmt.Println("Error generating random nonce:", err)
+		fmt.Errorf("Error generating random nonce: %s\n", err)
+		return nil, nil, err
 	}
 
 	// Compute R = k * G and set r as the x-coordinate of R
 	rx, ry := curve.ScalarBaseMult(k.Bytes())
-
-	// Test of correctness of getYcoord func
-	testy1, testy2, err := getYCoordinates(rx)
-	if err != nil {
-		fmt.Println("Error getYCoordinate:", err)
-	}else {
-		if ry.Cmp(testy1) != 0 {
-			fmt.Println("Retrieved RY1 does not match!")
-		} else {
-			fmt.Println("Retrieved RY1 matches!!!")
-		}
-		if ry.Cmp(testy2) != 0 {
-			fmt.Println("Retrieved RY2 does not match!")
-		} else {
-			fmt.Println("Retrieved RY2 matches!!!")
-		}
-	}
 
 	// Compress R point
 	compressedR, err := compressPoint(curve, rx, ry)
@@ -401,34 +411,6 @@ func ecdsaSign(privateKey *ecdsa.PrivateKey, message []byte) (r, s *big.Int, err
 
 // HELPER Functions
 
-// Given a x coord from a point in elliptic curve, return the possible y values
-func getYCoordinates(x *big.Int) (*big.Int, *big.Int, error) {
-
-	// Calculate y^2 = x^3 + a*x + b (mod p)
-	// x^3
-	xSquared := new(big.Int).Mul(x, x)
-	xCubed := new(big.Int).Mul(xSquared, x)
-
-	a := big.NewInt(-3)
-	
-	// ySquared = x^3 + a*x + b (mod p)
-	ySquared := new(big.Int).Add(xCubed, new(big.Int).Mul(a, x))
-	ySquared.Add(ySquared, curve.Params().B)
-	ySquared.Mod(ySquared, curve.Params().P)
-
-	// Calculate the square root of y^2 to get y (mod p)
-	y := new(big.Int).ModSqrt(ySquared, curve.Params().P)
-	if y == nil {
-		return nil, nil, fmt.Errorf("no square root exists for the given x-coordinate on the P-256 curve")
-	}
-
-	// calculate the second y value
-	y2 := new(big.Int).Neg(y)
-	y2.Mod(y2, curve.Params().P)
-
-	return y, y2, nil
-}
-
 func compressPoint(curve elliptic.Curve, x, y *big.Int) ([]byte, error) {
 
 	compressedPoint := elliptic.MarshalCompressed(curve, x, y)
@@ -458,18 +440,64 @@ func Hash(s string) *big.Int {
     return m
 }
 
-func pubkey2String(pubkey ecdsa.PublicKey) string {
-	// 3.1 Convert public key to PEM format
-	pemBytes, err := x509.MarshalPKIXPublicKey(&pubkey)
-	if err != nil {
-		fmt.Println("Error:", err)
-		os.Exit(1)
+// Given a x coord from a point in elliptic curve, return the possible y values
+func getYCoordinates(x *big.Int) (*big.Int, *big.Int, error) {
+
+	// Calculate y^2 = x^3 + a*x + b (mod p)
+	// x^3
+	xSquared := new(big.Int).Mul(x, x)
+	xCubed := new(big.Int).Mul(xSquared, x)
+
+	a := big.NewInt(-3)
+	
+	// ySquared = x^3 + a*x + b (mod p)
+	ySquared := new(big.Int).Add(xCubed, new(big.Int).Mul(a, x))
+	ySquared.Add(ySquared, curve.Params().B)
+	ySquared.Mod(ySquared, curve.Params().P)
+
+	// Calculate the square root of y^2 to get y (mod p)
+	y := new(big.Int).ModSqrt(ySquared, curve.Params().P)
+	if y == nil {
+		return nil, nil, fmt.Errorf("no square root exists for the given x-coordinate on the P-256 curve")
 	}
 
-	// 3.2 Encode PEM bytes to string
-	pemString := string(pem.EncodeToMemory(&pem.Block{
-		Type:  "PUBLIC KEY",
-		Bytes: pemBytes,
-	}))
-	return pemString
+	// calculate the second y value
+	y2 := new(big.Int).Neg(y)
+	y2.Mod(y2, curve.Params().P)
+
+	return y, y2, nil
+}
+
+// Qa' = (m * G) + (r * Qa)
+func checkYCoordinates(y1, y2, r, s, m *big.Int, qa *ecdsa.PublicKey) *big.Int {
+
+    stp1X, stp1Y := qa.Curve.ScalarBaseMult(m.Bytes())
+
+	var currentY *big.Int
+
+	for i:=1; i<= 2; i++ {
+		if i == 1 {
+			currentY = y1
+		} else {
+			currentY = y2
+		}
+		   // Calculate QaPrime for y
+		   QaPrimeX, QaPrimeY := curve.ScalarMult(r, currentY, s.Bytes())
+		   QaPrime := &ecdsa.PublicKey{
+			   Curve: curve,
+			   X:     QaPrimeX,
+			   Y:     QaPrimeY,
+		   }
+
+	   	   // Calculate the first verification value: (m * G) + (r * Qa)
+		   stp2X, stp2Y := qa.Curve.ScalarMult(qa.X, qa.Y, r.Bytes())
+		   finalX, finalY := qa.Curve.Add(stp1X, stp1Y, stp2X, stp2Y)
+	   
+		   // Compare Qa' with the calculated value for y
+		   if finalX.Cmp(QaPrime.X) == 0 && finalY.Cmp(QaPrime.Y) == 0 {
+			   return currentY
+		   }
+	}
+
+    return nil
 }
