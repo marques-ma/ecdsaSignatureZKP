@@ -13,9 +13,9 @@ import (
 )
 
 type proof struct {
-	QaPrime  	*ecdsa.PublicKey	`json:"QaPrime"`
-	OriginalRy  *big.Int			`json:"OriginalRy, omitempty"`
-	Proof		*ecdsaSignature		`json:"Proof"`
+	QaPrime			*ecdsa.PublicKey	`json:"QaPrime"`
+	CompressedR		[]byte				`json:"CompressedRx, omitempty"`
+	Proof			*ecdsaSignature		`json:"Proof"`
 }
 
 type ecdsaSignature struct {
@@ -28,11 +28,15 @@ type ecdsaPoint struct {
 
 var (
 	curve = elliptic.P256()
-	tokenPayload = "tokenpayload"
+	tokenPayload1 = "First message to be signed"
+	tokenPayload2 = "Second message to be included in ZKP"
 )
 
 
 func main() {
+
+	// Choose signature scheme
+	compressedMode := true
 
 	// Generate ECDSA key pair
 	privateKey, err := ecdsa.GenerateKey(curve, rand.Reader)
@@ -41,22 +45,24 @@ func main() {
 		return
 	}
 
-	// Sign the token payload with standard ECDSA scheme (not-compressed R)
-	hash := Hash(tokenPayload)
-	r, s, err := ecdsa.Sign(rand.Reader, privateKey, hash.Bytes())
-	if err != nil {
-		fmt.Printf("Error signing token payload: %s\n", err)
-		return
-	}
-
-	// // // ECDSA signature with compressed R point
-	// fmt.Printf("Generate ECDSA signature:\n")
-	// r, s, err := ecdsaSign(privateKey, []byte(tokenPayload))
-	// if err != nil {
-	// 	fmt.Printf("Error signing token payload: %s\n", err)
-	// 	return
-	// }
-	
+	var r, s *big.Int
+	if compressedMode == true {
+		// ECDSA signature with compressed R point
+		fmt.Printf("Generate ECDSA signature:\n")
+		r, s, err = ecdsaSign(privateKey, []byte(tokenPayload1))
+		if err != nil {
+			fmt.Printf("Error signing token payload: %s\n", err)
+			return
+		}
+	} else {
+		// Sign the token payload with standard ECDSA scheme (not-compressed R)
+		hash := Hash(tokenPayload1)
+		r, s, err = ecdsa.Sign(rand.Reader, privateKey,  hash.Bytes())
+		if err != nil {
+			fmt.Printf("Error signing token payload: %s\n", err)
+			return
+		}
+	}	
 	fmt.Printf("-------------------\n\n")
 
 	// Encode the ECDSA signature
@@ -68,7 +74,7 @@ func main() {
 
 	// Generate zero-knowledge proof
 	fmt.Printf("Generate ZKP of ECDSA signature:\n")
-	zkProof, err := GenerateZKP(privateKey, signatureBytes, []byte(tokenPayload), false)
+	zkProof, err := GenerateZKP(privateKey, signatureBytes, [][]byte{[]byte(tokenPayload1),[]byte(tokenPayload2)}, compressedMode)
 	if err != nil {
 		fmt.Printf("Error generating zero-knowledge proof: %s\n", err)
 		return
@@ -78,7 +84,7 @@ func main() {
 	// Verify zero-knowledge proof
 	fmt.Printf("Verify ZKP of ECDSA signature:\n")
 	publicKey := privateKey.Public()
-	if !VerifyZKP(zkProof, r.Bytes(), publicKey.(*ecdsa.PublicKey), []byte(tokenPayload), false) {
+	if !VerifyZKP(zkProof,publicKey.(*ecdsa.PublicKey), [][]byte{[]byte(tokenPayload1),[]byte(tokenPayload2)}) {
 		fmt.Printf("ZKP not valid!!\n")
 		return
 	}
@@ -98,12 +104,11 @@ func main() {
 	fmt.Printf("-------------------\n\n")
 }
 
-func GenerateZKP(privateKey *ecdsa.PrivateKey, signature, message []byte, compressed bool) (zkProof *proof, err error) {
+func GenerateZKP(privateKey *ecdsa.PrivateKey, signature []byte, message [][]byte, compressed bool) (zkProof *proof, err error) {
 
-	// 1 - to Calculate Qa' = signature.s * R is
-	// 
-	// Necessary to retrieve y-coord from compact R point:
-	// 
+	fmt.Println("Message to be included in ZKP: ", string(message[1]))
+
+	// 1 - Retrieve y-coord from R point to Calculate Qa' = signature.s * R
 	// 1.1 - Extract r and s from the original ECDSA signature
 	asn1Sig := new(ecdsaSignature)
 	_, err = asn1.Unmarshal(signature, asn1Sig)
@@ -111,41 +116,43 @@ func GenerateZKP(privateKey *ecdsa.PrivateKey, signature, message []byte, compre
 		return nil, fmt.Errorf("error parsing ASN.1 signature: %s", err)
 	}
 
-	// 2 - Compute h' = HASH(Qa' || m) or HASH(m) (?)
-	m := Hash(string(message))
+	// 2 - Compute hashes 
+	// TODO: Inlcude Pubkeys e.g.: h' = HASH(Qa' || message to be included in ZKP)
+	m			:= Hash(string(message[0]))
+	newMessage	:= Hash(string(message[1]))
 
 	var RPoint *ecdsaPoint
 	if compressed == true {
-		// 1.2 - Recover the y-coordinate from the signature.r (x-coordinate)
+		// 2.1 - Recover the y-coordinate from the signature.r (x-coordinate)
 		coordX, coordY, err := uncompressPoint(curve, asn1Sig.R.Bytes())
 		if err != nil {
 			return nil, fmt.Errorf("error recovering y-coordinate from R: %s", err)
 		}
 	
-		// 1.3 - Create a valid point on the curve
+		// 2.2 - Create a valid point on the curve
 		RPoint = &ecdsaPoint{
 			X:     coordX,
 			Y:     coordY,
 		}
 	} else {
-		// 1.2 - Recover the 2 y-coordinates from the signature.r (x-coordinate)
+		// 2.1 - Recover the 2 y-coordinates from the signature.r (x-coordinate)
 		y1, y2, err := getYCoordinates(asn1Sig.R)
 		if err != nil {
 			return nil, fmt.Errorf("error recovering y-coordinate from R: %s", err)
 		}
 
-		// perform the validation of y coordinates through checking Qa' = (m * G) + (r * Qa)
+		// 2.2 - Validate y coordinates through checking Qa' = (m * G) + (r * Qa)
 		correctY := checkYCoordinates(y1, y2, asn1Sig.R, asn1Sig.S, m, privateKey.Public().(*ecdsa.PublicKey))
 		if correctY == nil {
 			return nil, fmt.Errorf("No valid y-coordinate values recovered: %s", err)
 		}
-		// Verify if point is on curve
+		// 2.3 - Verify if point is on curve
 		if !curve.IsOnCurve(asn1Sig.R, correctY) {
 			return nil, fmt.Errorf("Point is not on Curve!!\n")
 		}
 		fmt.Println("VALID COORDINATE FOUND!")
 
-		// 1.3 - Create a valid point on the curve
+		// 2.4 - Create a valid point on the curve
 		RPoint = &ecdsaPoint{
 			X:     asn1Sig.R,
 			Y:     correctY,
@@ -172,7 +179,7 @@ func GenerateZKP(privateKey *ecdsa.PrivateKey, signature, message []byte, compre
 		fmt.Println("Error compressing point:", err)
 	}
 
-	/////// TEST
+	/////// Debug and TEST
 		// // (R' * m') / k' = m' * R
 
 		// // (R' * m')
@@ -201,72 +208,78 @@ func GenerateZKP(privateKey *ecdsa.PrivateKey, signature, message []byte, compre
 	// Compute s' = k'^{-1}(m + signature.S * r')
 	// k'^{-1}
 	invK := new(big.Int).ModInverse(kPrime, curve.Params().N)
+	// (signature.S * r')
 	s := new(big.Int).Mul(asn1Sig.S, RPrimeX)
-	s.Add(s, m)
+	// (m + signature.S * r')
+	s.Add(s, newMessage)
+	// k'^{-1}(m + signature.S * r')
 	s.Mul(s, invK)
 	s.Mod(s, curve.Params().N)
 
+	// Compress original R point to ease the retrieval of its coordinates in validation
+	compressedR, err := compressPoint(curve, RPoint.X, RPoint.Y)
+	if err != nil {
+		return nil, fmt.Errorf("error compressing R: %s\n", err)
+	}
+
 	// Assign values to zkProof
 	zkProof  = &proof{
-		QaPrime: &ecdsa.PublicKey{
-			Curve: curve,
-			X:     QaPrimeX,
-			Y:     QaPrimeY,
+		CompressedR:	compressedR,
+		QaPrime:		&ecdsa.PublicKey{
+			Curve:		curve,
+			X:			QaPrimeX,
+			Y:			QaPrimeY,
 		},
-		OriginalRy: RPoint.Y,
-		Proof: &ecdsaSignature{
-			R:	new(big.Int).SetBytes(compressedRPrime),
-			S:	s,
+		Proof:			&ecdsaSignature{
+			R:			new(big.Int).SetBytes(compressedRPrime),
+			S:			s,
 		},
 	}
 	return zkProof, nil
 }
 
-func VerifyZKP(zkProof *proof, originalRxCoordinate []byte, publicKey *ecdsa.PublicKey, message []byte, compressed bool) bool {
-	
-	var RPoint *ecdsaPoint
-	if compressed == true {
-		// 1.2 - Recover the y-coordinate from the signature.r (x-coordinate)
-		coordX, coordY, err := uncompressPoint(curve, originalRxCoordinate)
-		if err != nil {
-			fmt.Errorf("error recovering y-coordinate from R: %s\n", err)
-			return false
-		}
+func VerifyZKP(zkProof *proof, publicKey *ecdsa.PublicKey, message [][]byte) bool {
 
-		// 1.3 - Create a valid point on the curve
-		RPoint = &ecdsaPoint{
-			X:     coordX,
-			Y:     coordY,
-		}
-
-	} else {
-		// 1.2 - Recover the y-coordinate zkProof.OriginalRy and build RPoint
-		RPoint = &ecdsaPoint{
-			X:     new(big.Int).SetBytes(originalRxCoordinate),
-			Y:     zkProof.OriginalRy,
-		}
+	// Print messages
+	for _, slice := range message {
+		fmt.Printf("Messages to be used in ZKP verification: %s\n", slice)
 	}
 
-	// Verify if RPoint is on curve
+	// 1.1 - uncompress signature.r to retrieve x and y-coordinate
+	coordX, coordY, err := uncompressPoint(curve, zkProof.CompressedR)
+	if err != nil {
+		fmt.Errorf("error recovering y-coordinate from R: %s\n", err)
+		return false
+	}
+
+	// 1.2 - Create a valid point on the curve
+	RPoint := &ecdsaPoint{
+		X:     coordX,
+		Y:     coordY,
+	}
+
+	// 1.3 - Verify if RPoint is on curve
 	if !curve.IsOnCurve(RPoint.X, RPoint.Y) {
 		fmt.Errorf("Point is not on Curve!!\n")
 		return false
 	}
 
-	// Compute h' = HASH(Qa' || m) or HASH(m) (?)
-	m := Hash(string(message))
+	// 2 - Compute h and h'
+	// TODO: Include pub keys on hash e.g.: HASH(Qa' || m) 
+	m		:= Hash(string(message[0]))
+	mPrime	:= Hash(string(message[1]))
 
-	// First verification consists in Verifying if Qa' = (m * G) + (r * Qa)
-	// m * G 
+	// 3 - First verification consists in Verifying if Qa' = (m * G) + (r * Qa)
+	// 3.1 - m * G 
 	stp1X, stp1Y := curve.ScalarBaseMult(m.Bytes())
 
-	// r * Qa
+	// 3.2 - r * Qa
 	stp2X, stp2Y := curve.ScalarMult(publicKey.X, publicKey.Y, RPoint.X.Bytes())
 
-	// m * G + r * Qa
+	// 3.3 - m * G + r * Qa
 	finalX, finalY := curve.Add(stp1X, stp1Y, stp2X, stp2Y)
 
-	// Parse coords to a point
+	// 3.4 - Parse coords to a point
 	var calcQaPrime ecdsa.PublicKey
 	calcQaPrime = ecdsa.PublicKey{
 		Curve: curve,
@@ -274,22 +287,28 @@ func VerifyZKP(zkProof *proof, originalRxCoordinate []byte, publicKey *ecdsa.Pub
 		Y:     finalY,
 	}
 
-	// check
+	// 3.5 - Compare zkProof.QaPrime with Calculated QaPrime
 	fmt.Printf("\nTEST 1: Comparing zkProof.QaPrime with calculated QaPrime ((m * G) + (r * Qa)): \n")
 	fmt.Println(`zkProof.QaPrime.X: `, zkProof.QaPrime.X)
 	fmt.Println(`Calculated Qa'.X : `, calcQaPrime.X)
-	fmt.Println(`zkProof.QaPrime.Y: `, zkProof.QaPrime.Y)
-	fmt.Println(`Calculated Qa'.Y : `, calcQaPrime.Y)
-	if (zkProof.QaPrime.X.Cmp(calcQaPrime.X) != 0) || (zkProof.QaPrime.Y.Cmp(calcQaPrime.Y) != 0) {
-		fmt.Println(`TEST 1 FAILED!!!`)
+	if (zkProof.QaPrime.X.Cmp(calcQaPrime.X) != 0) {
+		fmt.Println(`Qa' x-coordinates does not match!!!`)
 		return false
 	} else {
-		fmt.Println(`TEST 1 Successful!!!`)
+		fmt.Println(`Qa' x-coordinates matches!!!`)
+	}
+	fmt.Println(`zkProof.QaPrime.Y: `, zkProof.QaPrime.Y)
+	fmt.Println(`Calculated Qa'.Y : `, calcQaPrime.Y)
+	if (zkProof.QaPrime.Y.Cmp(calcQaPrime.Y) != 0) {
+		fmt.Println(`Qa' y-coordinates does not match!!!`)
+		return false
+	} else {
+		fmt.Println(`Qa' y-coordinates matches!!!`)
 	}
 
-	// Second verification is to verify if s' * R' = (m' * R) + (r' * Qa')
+	// 4 - Second verification is to verify if s' * R' = (m' * R) + (r' * Qa')
 
-	// 1 - s' * R' 
+	// 4.1 - s' * R' 
 	// Uncompress RPrime
 	uncX, uncY, err := uncompressPoint(curve, zkProof.Proof.R.Bytes())
 	if err != nil {
@@ -297,29 +316,27 @@ func VerifyZKP(zkProof *proof, originalRxCoordinate []byte, publicKey *ecdsa.Pub
 		return false
 	}
 
-	// 1.1 -  Verify if uncompressed RPrime is on curve
+	// 4.2 - Verify if uncompressed RPrime is on curve
 	if !curve.IsOnCurve(uncX, uncY) {
 		fmt.Errorf("Uncompressed RPrime is not on Curve!!\n")
 		return false
 	}
 
-	// 1.2 - Compute s' * R' 
+	// 4.3 - Compute s' * R' 
 	leftSideX, leftSideY := curve.ScalarMult(uncX, uncY, zkProof.Proof.S.Bytes())
 	
-	// 2 - (m * R)
-	// PS: HERE WE ARE CONSIDERING THAT WE ARE USING CUSTOM ECDSA SIGNATURE, WHERE R IS A COMPRESSED POINT. 
-	// IF WE ARE USING A STANDARD ECDSA SIGNATURE, WE NEED TO USE getYCoordinates FUNC AND VERIFY WHICH OF 2 Y RETURNED IS CORRECT.
-	NewX, NewY := curve.ScalarMult(RPoint.X, RPoint.Y, m.Bytes())
+	// 4.4 - (m' * R)
+	NewX, NewY := curve.ScalarMult(RPoint.X, RPoint.Y, mPrime.Bytes())
 
-	// 3 - r' * Qa'
+	// 4.5 - r' * Qa'
 	rightSideX, rightSideY := curve.ScalarMult(zkProof.QaPrime.X, zkProof.QaPrime.Y, uncX.Bytes())
 	
-	// 4 - (m * R) + (r' * Qa')
+	// 4.6 - (m' * R) + (r' * Qa')
 	lastX, lastY := curve.Add(NewX, NewY, rightSideX, rightSideY)
 
-	// Verify correctness
+	// 4.7 - Compare left side with right side equation
 	fmt.Printf("\n")
-	fmt.Println(`TEST 2: s' * R' = (m * R) + (r' * Qa'): `)
+	fmt.Println(`TEST 2: s' * R' = (m' * R) + (r' * Qa'): `)
 	if (leftSideX.Cmp(lastX) != 0) || (leftSideY.Cmp(lastY) != 0) {
 		fmt.Errorf("TEST 2 FAILED!!!!!\n")
 		return false
@@ -330,6 +347,8 @@ func VerifyZKP(zkProof *proof, originalRxCoordinate []byte, publicKey *ecdsa.Pub
 }
 
 func ecdsaSign(privateKey *ecdsa.PrivateKey, message []byte) (r, s *big.Int, err error) {
+
+	fmt.Println("Message to be signed: ", string(message))
 
 	// Step 1: Generate a random nonce (k)
 	k, err := rand.Int(rand.Reader, curve.Params().N)
